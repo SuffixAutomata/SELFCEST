@@ -17,7 +17,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from uuid import uuid4
 
 import hydra
@@ -40,6 +40,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
+    rollout_trace_add_tags,
     rollout_trace_attr,
     rollout_trace_op,
 )
@@ -144,6 +145,8 @@ class AgentLoopOutput(BaseModel):
     """Number of chat turns, including user, assistant, tool."""
     metrics: AgentLoopMetrics
     """Auxiliary performance metrics"""
+    rollout_trace_tags: dict[str, Any] = {}
+    """Extra tags to attach to the rollout trace."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 
@@ -225,7 +228,7 @@ class AgentLoopBase(ABC):
         cls._class_initialized = True
 
     @abstractmethod
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | list[AgentLoopOutput]:
         """Run agent loop to interact with LLM server and environment.
 
         Args:
@@ -233,7 +236,8 @@ class AgentLoopBase(ABC):
             **kwargs: dataset fields from `verl.utils.dataset.RLHFDataset`.
 
         Returns:
-            AgentLoopOutput: Agent loop output.
+            AgentLoopOutput | list[AgentLoopOutput]: Agent loop output(s). Multiple outputs will be fanned out as
+            separate samples downstream.
         """
         raise NotImplementedError
 
@@ -392,7 +396,15 @@ class AgentLoopWorkerBase:
             )
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs)
+        # AgentLoop.run can optionally return multiple trajectories; flatten them here
+        flat_outputs: list[_InternalAgentLoopOutput] = []
+        for output in outputs:
+            if isinstance(output, list):
+                flat_outputs.extend(output)
+            else:
+                flat_outputs.append(output)
+
+        output = self._postprocess(flat_outputs)
 
         return output
 
@@ -404,7 +416,7 @@ class AgentLoopWorkerBase:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -425,12 +437,52 @@ class AgentLoopWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            outputs = await agent_loop.run(sampling_params, **kwargs)
+            normalized_outputs = self._normalize_agent_outputs(outputs)
+            merged_tags = self._merge_rollout_trace_tags(normalized_outputs)
+            if merged_tags:
+                rollout_trace_add_tags(merged_tags)
+            processed_outputs = [
+                await self._agent_loop_postprocess(output, **kwargs)
+                for output in normalized_outputs
+            ]
+            return processed_outputs if len(processed_outputs) > 1 else processed_outputs[0]
+
+    @staticmethod
+    def _normalize_agent_outputs(
+        outputs: AgentLoopOutput | Sequence[AgentLoopOutput],
+    ) -> list[AgentLoopOutput]:
+        """Convert AgentLoop.run result to a list for uniform downstream handling."""
+        if isinstance(outputs, AgentLoopOutput):
+            return [outputs]
+        if isinstance(outputs, Sequence):
+            outputs_list = list(outputs)
+            if not outputs_list:
+                raise ValueError("Agent loop returned an empty output sequence.")
+            if not all(isinstance(output, AgentLoopOutput) for output in outputs_list):
+                raise TypeError("All items returned by AgentLoop.run must be AgentLoopOutput instances.")
+            return outputs_list
+        raise TypeError("AgentLoop.run must return AgentLoopOutput or a sequence of AgentLoopOutput.")
+
+    @staticmethod
+    def _merge_rollout_trace_tags(outputs: Sequence[AgentLoopOutput]) -> dict[str, Any]:
+        merged_tags: dict[str, Any] = {}
+        for output in outputs:
+            tags = output.rollout_trace_tags or {}
+            if not isinstance(tags, dict):
+                raise TypeError("rollout_trace_tags must be a dict when provided.")
+            merged_tags.update(tags)
+        return merged_tags
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
-        output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        raw_prompt_override = output.extra_fields.pop("raw_prompt_override", None)
+        output.extra_fields["raw_prompt"] = raw_prompt_override or kwargs["raw_prompt"]
+        # Preserve the originating sample index so training can align fan-out rollouts (e.g., clones)
+        if "fanout_index" in kwargs:
+            output.extra_fields["__fanout_index__"] = kwargs["fanout_index"]
+        elif "index" in kwargs:
+            output.extra_fields["__fanout_index__"] = kwargs["index"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 

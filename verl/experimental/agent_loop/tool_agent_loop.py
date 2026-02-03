@@ -16,20 +16,27 @@ import copy
 import json
 import logging
 import os
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, _DummyConfig, register
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import add_generation_prompt_for_gpt_oss, format_gpt_oss_tool_response_manually
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
-from verl.tools.schemas import ToolResponse
+from verl.tools.schemas import (
+    OpenAIFunctionParametersSchema,
+    OpenAIFunctionPropertySchema,
+    OpenAIFunctionSchema,
+    OpenAIFunctionToolSchema,
+    ToolResponse,
+)
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.chat_template import initialize_system_prompt
 from verl.utils.profiler import simple_timer
-from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.rollout_trace import rollout_trace_add_tags, rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -41,6 +48,24 @@ class AgentState(Enum):
     PROCESSING_TOOLS = "processing_tools"
     TERMINATED = "terminated"
     INTERACTING = "interacting"
+
+
+@dataclass
+class CloneRunResult:
+    """Container for clone execution artifacts."""
+
+    clone_id: str
+    objective: str
+    label: str
+    visible_text: str
+    rollouts: list[AgentLoopOutput]
+
+
+@dataclass
+class ToolInvocationResult:
+    response: ToolResponse
+    reward: float | None
+    extra: dict[str, Any]
 
 
 class AgentData:
@@ -80,6 +105,11 @@ class AgentData:
         # Extra fields for dynamic addition
         self.extra_fields: dict[str, Any] = {}
 
+        # Clone orchestration
+        self.clone_rollouts: list[AgentLoopOutput] = []
+        self.clone_label_state = {"turn": None, "next_index": 0}
+        self.clone_label_lock = asyncio.Lock()
+
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
@@ -102,6 +132,14 @@ class ToolAgentLoop(AgentLoopBase):
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         cls.tools = {tool.name: tool for tool in tool_list}
         cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
+        cls.clone_config = cls._load_clone_runtime_config(config)
+        cls.clone_tool_name = cls.clone_config["tool_name"]
+        if cls.clone_config["enabled"]:
+            cls.clone_tool_schema = cls._build_clone_tool_schema(cls.clone_config)
+            cls.tool_schemas.append(cls.clone_tool_schema.model_dump(exclude_unset=True, exclude_none=True))
+        # Store as a staticmethod to avoid Python binding it as an instance method
+        # (which would implicitly inject `self` and break the reward_fn signature).
+        cls.clone_reward_fn = staticmethod(cls._load_reward_fn(cls.clone_config))
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         cls.tool_parser_name = config.actor_rollout_ref.rollout.multi_turn.format
         print(f"Initialized tools: {cls.tools}")
@@ -117,7 +155,7 @@ class ToolAgentLoop(AgentLoopBase):
             cls.interaction_map: dict[str, BaseInteraction] = cls._initialize_interactions(cls.interaction_config_file)
 
     @rollout_trace_op
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | list[AgentLoopOutput]:
         messages = list(kwargs["raw_prompt"])
         image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
         metrics = {}
@@ -149,6 +187,14 @@ class ToolAgentLoop(AgentLoopBase):
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
         )
+        agent_data.extra_fields["clone_depth"] = kwargs.get("clone_depth", 0)
+        agent_data.extra_fields["parent_request_id"] = kwargs.get("parent_request_id")
+        agent_data.extra_fields["clone_label"] = kwargs.get("clone_label")
+        agent_data.extra_fields["clone_allow_tools"] = kwargs.get("clone_allow_tools", True)
+        agent_data.extra_fields["reward_model"] = kwargs.get("reward_model")
+        agent_data.extra_fields["data_source"] = kwargs.get("data_source")
+        agent_data.extra_fields["extra_info"] = kwargs.get("extra_info")
+        agent_data.extra_fields["sample_index"] = kwargs.get("index")
 
         # State machine loop
         state = AgentState.PENDING
@@ -158,7 +204,7 @@ class ToolAgentLoop(AgentLoopBase):
             elif state == AgentState.GENERATING:
                 state = await self._handle_generating_state(agent_data, sampling_params)
             elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
+                state = await self._handle_processing_tools_state(agent_data, sampling_params)
             elif state == AgentState.INTERACTING:
                 state = await self._handle_interacting_state(agent_data)
             else:
@@ -181,17 +227,61 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=agent_data.metrics,
             extra_fields={},
         )
-        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
-        return output
+        output.extra_fields.update({k: v for k, v in agent_data.extra_fields.items() if v is not None})
+        output.extra_fields.update(
+            {
+                "turn_scores": agent_data.turn_scores,
+                "tool_rewards": agent_data.tool_rewards,
+                "clone_depth": agent_data.extra_fields.get("clone_depth", 0),
+                "parent_request_id": agent_data.extra_fields.get("parent_request_id"),
+                "actor_role": "root" if agent_data.extra_fields.get("clone_depth", 0) == 0 else "clone",
+                "request_id": request_id,
+            }
+        )
+        if agent_data.clone_rollouts:
+            output.extra_fields["clone_children"] = [
+                clone.extra_fields.get("clone_id") for clone in agent_data.clone_rollouts
+            ]
+            output.extra_fields["clone_summaries"] = agent_data.extra_fields.get("clone_summaries", [])
+            # ensure turn level rewards persist across rollouts
+            for clone in agent_data.clone_rollouts:
+                clone.extra_fields.setdefault("turn_scores", [])
+                clone.extra_fields.setdefault("tool_rewards", [])
+
+        # Assign rewards to root + clones
+        if output.extra_fields.get("overlong_prompt"):
+            reward_value = 0.0
+            clone_rewards = None
+            output.extra_fields["reward_source"] = "overlong_prompt"
+        else:
+            reward_value, clone_rewards = self._assign_rewards(output, agent_data.clone_rollouts)
+            # rollout_trace_add_tags({"assigned_reward": reward_value})
+            output.extra_fields["reward_source"] = "clone_reward_fn"
+
+        outputs = [output, *agent_data.clone_rollouts] if agent_data.clone_rollouts else [output]
+        for rollout in outputs:
+            if rollout is output:
+                rollout.reward_score = reward_value
+            else:
+                mapped = None
+                if clone_rewards:
+                    request_id = rollout.extra_fields.get("request_id")
+                    if request_id is not None:
+                        mapped = clone_rewards.get(str(request_id))
+                rollout.reward_score = mapped if mapped is not None else reward_value
+            rollout.extra_fields.setdefault("reward_source", "clone_reward_fn")
+
+        return outputs if len(outputs) > 1 else outputs[0]
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
+        tool_schemas = self._active_tool_schemas(agent_data)
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
                     agent_data.messages,
-                    tools=self.tool_schemas,
+                    tools=tool_schemas,
                     add_generation_prompt=True,
                     tokenize=False,
                     **self.apply_chat_template_kwargs,
@@ -204,12 +294,25 @@ class ToolAgentLoop(AgentLoopBase):
                 None,
                 lambda: self.tokenizer.apply_chat_template(
                     agent_data.messages,
-                    tools=self.tool_schemas,
+                    tools=tool_schemas,
                     add_generation_prompt=True,
                     tokenize=True,
                     **self.apply_chat_template_kwargs,
                 ),
             )
+        if len(agent_data.prompt_ids) > self.prompt_length:
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = 0
+            agent_data.extra_fields["overlong_prompt"] = True
+            agent_data.extra_fields["overlong_prompt_length"] = len(agent_data.prompt_ids)
+            agent_data.extra_fields["overlong_prompt_max"] = self.prompt_length
+            # Provide minimal placeholder tokens so downstream padding keeps tensor shapes.
+            agent_data.prompt_ids = [pad_token_id, pad_token_id]
+            agent_data.response_ids = []
+            agent_data.response_mask = [0]
+            agent_data.response_logprobs = []
+            return AgentState.TERMINATED
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -263,7 +366,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             return AgentState.TERMINATED
 
-    async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+    async def _handle_processing_tools_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
         add_messages: list[dict[str, Any]] = []
         new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
@@ -271,15 +374,18 @@ class ToolAgentLoop(AgentLoopBase):
         tasks = []
         tool_call_names = []
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
-            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs))
+            tasks.append(self._call_tool(tool_call, agent_data, sampling_params))
             tool_call_names.append(tool_call.name)
 
         with simple_timer("tool_calls", agent_data.metrics):
-            responses = await asyncio.gather(*tasks)
+            responses: list[ToolInvocationResult] = await asyncio.gather(*tasks)
 
         # Process tool responses and update multi_modal_data
-        # Removed: agent_data.new_images_this_turn = []
-        for tool_response, tool_reward, _ in responses:
+        for invocation_result in responses:
+            tool_response = invocation_result.response
+            tool_reward = invocation_result.reward
+            extra = invocation_result.extra or {}
+
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
@@ -309,16 +415,14 @@ class ToolAgentLoop(AgentLoopBase):
                 if isinstance(tool_response.image, list):
                     # Ensure all elements in the list are valid image objects
                     for img in tool_response.image:
-                        if img is not None:  # Add a check to ensure the image is not None
-                            new_images_this_turn.append(img)  # Using local variable
+                        if img is not None:
+                            new_images_this_turn.append(img)
                 else:
-                    # Ensure the image is not None
                     if tool_response.image is not None:
-                        new_images_this_turn.append(tool_response.image)  # Using local variable
+                        new_images_this_turn.append(tool_response.image)
 
             # Handle video data
             if tool_response.video:
-                # Currently not supported, raise informative error
                 logger.warning("Multimedia type 'video' is not currently supported. Only 'image' is supported.")
                 raise NotImplementedError(
                     "Multimedia type 'video' is not currently supported. Only 'image' is supported."
@@ -326,6 +430,10 @@ class ToolAgentLoop(AgentLoopBase):
 
             if tool_reward is not None:
                 agent_data.tool_rewards.append(tool_reward)
+
+            if extra.get("clone_rollouts"):
+                agent_data.clone_rollouts.extend(extra["clone_rollouts"])
+                agent_data.extra_fields.setdefault("clone_summaries", []).extend(extra.get("clone_summaries", []))
 
         agent_data.messages.extend(add_messages)
         # Update prompt with tool responses
@@ -339,14 +447,12 @@ class ToolAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            # Use only the new images from this turn for processing tool responses
-            current_images = new_images_this_turn if new_images_this_turn else None  # Using local variable
+            current_images = new_images_this_turn if new_images_this_turn else None
             model_inputs = self.processor(text=[raw_tool_response], images=current_images, return_tensors="pt")
             response_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
         else:
             if self.tool_parser_name == "gpt-oss":
                 logger.info("manually format tool responses for gpt-oss")
-                # Format tool responses manually
                 tool_response_texts = []
                 for i, tool_msg in enumerate(add_messages):
                     actual_tool_name = tool_call_names[i]
@@ -365,7 +471,6 @@ class ToolAgentLoop(AgentLoopBase):
                 response_ids = response_ids[len(self.system_prompt) :]
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
             return AgentState.TERMINATED
-        # Update prompt_ids and response_mask
 
         if new_images_this_turn:
             if agent_data.image_data is None:
@@ -434,40 +539,71 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.GENERATING
 
     async def _call_tool(
-        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any]
-    ) -> tuple[ToolResponse, float, dict]:
+        self, tool_call: FunctionCall, agent_data: AgentData, sampling_params: dict[str, Any]
+    ) -> ToolInvocationResult:
         """Call tool and return tool response."""
+        tool_name = tool_call.name
+        tool_repaired = bool(getattr(tool_call, "repaired", False))
+        agent_data.extra_fields["tool_json_total_calls"] = agent_data.extra_fields.get("tool_json_total_calls", 0) + 1
+        try:
+            tool_args = json.loads(tool_call.arguments)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            agent_data.extra_fields["tool_json_parse_failures"] = (
+                agent_data.extra_fields.get("tool_json_parse_failures", 0) + 1
+            )
+            logger.warning(f"Error decoding tool arguments for {tool_name}: {e}")
+            return ToolInvocationResult(
+                response=ToolResponse(text=f"Error when decoding tool arguments for {tool_name}: {e}"),
+                reward=0.0,
+                extra={},
+            )
+
+        if not isinstance(tool_args, dict):
+            agent_data.extra_fields["tool_json_parse_failures"] = (
+                agent_data.extra_fields.get("tool_json_parse_failures", 0) + 1
+            )
+            logger.warning(f"Error decoding tool arguments for {tool_name}: arguments must be an object")
+            return ToolInvocationResult(
+                response=ToolResponse(text=f"Error when decoding tool arguments for {tool_name}: arguments not object"),
+                reward=0.0,
+                extra={},
+            )
+
+        if tool_repaired:
+            agent_data.extra_fields["tool_json_repair_count"] = (
+                agent_data.extra_fields.get("tool_json_repair_count", 0) + 1
+            )
+
+        # Handle cloning as a built-in tool
+        if self.clone_config["enabled"] and tool_name == self.clone_tool_name:
+            response, reward, extra = await self._execute_clone_tool(tool_args, agent_data, sampling_params)
+            return ToolInvocationResult(response=response, reward=reward, extra=extra)
+
         tool, instance_id = None, None
         try:
-            # TODO: append malformed tool_call to the prompt: invalid function name or arguments
-            tool_name = tool_call.name
-            tool_args = json.loads(tool_call.arguments)
+            if tool_name not in self.tools:
+                raise KeyError(f"Tool '{tool_name}' not found. Available tools: {list(self.tools.keys())}")
+
             tool = self.tools[tool_name]
-            kwargs = tools_kwargs.get(tool_name, {})
+            kwargs = agent_data.tools_kwargs.get(tool_name, {})
             instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
             tool_execution_response, tool_reward, res = await tool.execute(instance_id, tool_args)
         except Exception as e:
-            logger.warning(f"Error when executing tool: {e}")
-            return (
-                ToolResponse(
+            logger.warning(f"Error when executing tool '{tool_name}': {e}")
+            return ToolInvocationResult(
+                response=ToolResponse(
                     text=f"Error when executing tool: {e}",
                 ),
-                0.0,
-                {},
+                reward=0.0,
+                extra={},
             )
         finally:
             if tool and instance_id:
                 await tool.release(instance_id)
 
         tool_response_text = tool_execution_response.text
-        if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
-            if self.tool_response_truncate_side == "left":
-                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
-            elif self.tool_response_truncate_side == "right":
-                tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
-            else:
-                length = self.max_tool_response_length // 2
-                tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
+        if tool_response_text:
+            tool_response_text = self._truncate_tool_response_text(tool_response_text)
 
         # Create ToolResponse from tool execution result
         tool_response_kwargs = {"text": tool_response_text}
@@ -479,7 +615,799 @@ class ToolAgentLoop(AgentLoopBase):
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
 
-        return ToolResponse(**tool_response_kwargs), tool_reward, res
+        return ToolInvocationResult(
+            response=ToolResponse(**tool_response_kwargs), reward=tool_reward, extra=res or {}
+        )
+
+    def _truncate_tool_response_text(
+        self, text: str, *, max_length: Optional[int] = None, truncate_side: Optional[str] = None
+    ) -> str:
+        if not text:
+            return text or ""
+        limit = self.max_tool_response_length if max_length is None else max_length
+        try:
+            limit = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            limit = self.max_tool_response_length
+        if not limit or len(text) <= limit:
+            return text
+        side = truncate_side or self.tool_response_truncate_side
+        if side == "left":
+            return text[:limit] + "...(truncated)"
+        if side == "right":
+            return "(truncated)..." + text[-limit:]
+        length = limit // 2
+        return text[:length] + "...(truncated)..." + text[-length:]
+
+    def _active_tool_schemas(self, agent_data: AgentData) -> list[dict[str, Any]]:
+        """Return the tool schemas that should be exposed for this request."""
+        if not agent_data.extra_fields.get("clone_allow_tools", True):
+            return []
+        if not self.clone_config.get("enabled", False):
+            return self.tool_schemas
+
+        depth = agent_data.extra_fields.get("clone_depth", 0)
+        if depth >= self.clone_config["max_clone_depth"]:
+            return [
+                schema
+                for schema in self.tool_schemas
+                if schema.get("function", {}).get("name") != self.clone_tool_name
+            ]
+        return self.tool_schemas
+
+    @classmethod
+    def _load_clone_runtime_config(cls, config):
+        clone_cfg = getattr(config.actor_rollout_ref.rollout.multi_turn, "clone", None)
+
+        def _get(key, default):
+            if clone_cfg is None:
+                return default
+            if isinstance(clone_cfg, dict):
+                return clone_cfg.get(key, default)
+            if hasattr(clone_cfg, key):
+                return getattr(clone_cfg, key)
+            try:
+                return clone_cfg[key]
+            except Exception:
+                return default
+
+        final_markers = _get(
+            "final_answer_markers",
+            ["</think>", "Final Answer:", "final answer:", "Answer:", "Result:", "OUTPUT:"],
+        )
+        if isinstance(final_markers, str):
+            final_markers = [final_markers]
+
+        return {
+            "enabled": _get("enable", True),
+            "tool_name": _get("tool_name", "spawn_clone"),
+            "max_clones_per_call": _get("max_clones_per_call", 3),
+            "max_clone_depth": _get("max_clone_depth", 1),
+            "allow_tool_use": _get("allow_tool_use", True),
+            "allow_nested_clones": _get("allow_nested_clones", False),
+            "max_response_length": _get("max_response_length", None),
+            "system_prompt": _get(
+                "system_prompt",
+                (
+                    "You are a helper clone spawned by a root agent. "
+                    "You may receive shared context that has been expanded from dataset keys. "
+                    "Denote a concise final answer with \"Answer:\". "
+                    "Prefer short, actionable responses and conserve tokens. "
+                    "If you cannot complete the objective, state a brief failure reason."
+                ),
+            ),
+            "final_answer_markers": final_markers,
+            "reward_function": _get("reward_function", None),
+            "debug_reward_fields": _get("debug_reward_fields", False),
+            "json_repair_penalty": _get("json_repair_penalty", 0.0),
+            "summary_max_length": _get("summary_max_length", None),
+            "summary_truncate_side": _get("summary_truncate_side", None),
+        }
+
+    @classmethod
+    def _build_clone_tool_schema(cls, clone_config: dict[str, Any]) -> OpenAIFunctionToolSchema:
+        """Build a simple schema that advertises the clone tool to the root agent."""
+        return OpenAIFunctionToolSchema(
+            type="function",
+            function=OpenAIFunctionSchema(
+                name=clone_config["tool_name"],
+                description="Fork clones of the current model to work on subtasks and report back succinctly.",
+                parameters=OpenAIFunctionParametersSchema(
+                    type="object",
+                    properties={
+                        "objectives": OpenAIFunctionPropertySchema(
+                            type="array",
+                            description="List of independent prompts to spawn clones of in parallel. Engineer carefully.",
+                        ),
+                        "shared_context": OpenAIFunctionPropertySchema(
+                            type="array",
+                            description=(
+                                "Context key(s) from the dataset index to share; the agent loop expands keys into text."
+                            ),
+                        ),
+                        # "allow_tools": OpenAIFunctionPropertySchema(
+                        #     type="boolean",
+                        #     description="Let clones use the same toolset; defaults to config.",
+                        # ),
+                    },
+                    required=["objectives"],
+                ),
+            ),
+        )
+
+    def _strip_thinking(self, text: str) -> str:
+        """Remove chain-of-thought markers and return the final answer."""
+        if not text:
+            return ""
+
+        stripped = text
+        if "</think>" in stripped:
+            stripped = stripped.split("</think>")[-1]
+
+        for marker in self.clone_config["final_answer_markers"]:
+            if marker in stripped:
+                stripped = stripped.split(marker, 1)[-1]
+
+        stripped = stripped.strip()
+        if stripped:
+            return stripped
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    def _clone_turn_index(self, agent_data: AgentData) -> int:
+        """Return the zero-based assistant turn index for labeling clones."""
+        return max(agent_data.assistant_turns - 1, 0)
+
+    def _default_clone_label(self, agent_data: AgentData, index: int) -> str:
+        turn_index = self._clone_turn_index(agent_data)
+        return f"turn{turn_index}_clone{index}"
+
+    def _resolve_clone_label(self, agent_data: AgentData, name: Optional[str], index: int) -> str:
+        return name or self._default_clone_label(agent_data, index)
+
+    async def _allocate_clone_indices(
+        self,
+        agent_data: AgentData,
+        requests: list[dict[str, Any]],
+        rejected: list[dict[str, Any]],
+    ) -> None:
+        """Assign clone indices that are unique within the same assistant turn."""
+        if not requests and not rejected:
+            return
+        current_turn = self._clone_turn_index(agent_data)
+        async with agent_data.clone_label_lock:
+            state = agent_data.clone_label_state
+            if state["turn"] != current_turn:
+                state["turn"] = current_turn
+                state["next_index"] = 0
+            base_index = state["next_index"]
+            for request in requests:
+                request["index"] = base_index + int(request.get("index", 0) or 0)
+            for request in rejected:
+                request["index"] = base_index + int(request.get("index", 0) or 0)
+            state["next_index"] = base_index + len(requests) + len(rejected)
+
+    def _summarize_clone_error(self, error: Exception) -> str:
+        message = str(error).strip()
+        lowered = message.lower()
+        context_markers = [
+            "context length",
+            "maximum context",
+            "max context",
+            "context window",
+            "prompt too long",
+            "too many tokens",
+            "sequence length",
+            "input length",
+            "tokens exceed",
+        ]
+        if any(marker in lowered for marker in context_markers):
+            return "failed due to context limit"
+        if "cancelled" in lowered or "canceled" in lowered:
+            return "failed due to cancellation"
+        if "timeout" in lowered or "timed out" in lowered:
+            return "failed due to timeout"
+        if not message:
+            return "failed due to error"
+        cleaned = " ".join(message.split())
+        if len(cleaned) > 200:
+            cleaned = cleaned[:200].rstrip() + "..."
+        return f"failed due to error: {cleaned}"
+
+    @classmethod
+    def _load_reward_fn(cls, clone_config: dict[str, Any]):
+        """Load a user-provided reward function or fall back to a default no-op."""
+
+        def _default_reward_fn(root_answer: str, root_output: AgentLoopOutput, clone_rollouts: list[AgentLoopOutput]):
+            return 0.0
+
+        path = clone_config.get("reward_function")
+        if not path:
+            return _default_reward_fn
+
+        # Supported formats:
+        # 1) File path: "/abs/path/to/file.py:func_name" (recommended for local experiments)
+        # 2) Python import path: "some.pkg.module.func_name"
+        try:
+            if ":" in path:
+                module_path, func_name = path.rsplit(":", 1)
+                from verl.utils.import_utils import load_extern_object
+
+                reward_fn = load_extern_object(module_path, func_name)
+                return reward_fn
+
+            module_path, _, func_name = path.rpartition(".")
+            if not module_path or not func_name:
+                logger.error("[BAD!!!] Invalid reward_function path '%s'; using default reward fn", path)
+                return _default_reward_fn
+
+            module = __import__(module_path, fromlist=[func_name])
+            reward_fn = getattr(module, func_name)
+            return reward_fn
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[BAD!!!] Failed to import reward_function '%s': %s; using default reward fn", path, exc)
+            return _default_reward_fn
+
+    def _assign_rewards(
+        self, root_output: AgentLoopOutput, clone_rollouts: list[AgentLoopOutput]
+    ) -> tuple[float, dict[str, float] | None]:
+        """Assign reward to root and optionally per-clone, bypassing default reward loop."""
+        try:
+            decoded_raw = self.tokenizer.decode(root_output.response_ids, skip_special_tokens=True)
+            decoded_masked = decoded_raw
+            if root_output.response_mask and root_output.response_ids:
+                masked_ids = [
+                    token_id for token_id, mask in zip(root_output.response_ids, root_output.response_mask) if mask
+                ]
+                decoded_masked = self.tokenizer.decode(masked_ids, skip_special_tokens=True)
+            root_answer = self._strip_thinking(decoded_masked)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[SHOULDN'T HAPPEN] Failed to decode root answer for reward fn: %s", exc)
+            decoded_raw = ""
+            decoded_masked = ""
+            root_answer = ""
+
+        clone_texts = {}
+        for clone in clone_rollouts or []:
+            extra = getattr(clone, "extra_fields", {}) or {}
+            request_id = extra.get("request_id")
+            if request_id is None:
+                continue
+            try:
+                if clone.response_mask and clone.response_ids:
+                    clone_masked_ids = [
+                        token_id for token_id, mask in zip(clone.response_ids, clone.response_mask) if mask
+                    ]
+                    clone_text = self.tokenizer.decode(clone_masked_ids, skip_special_tokens=True)
+                else:
+                    clone_text = self.tokenizer.decode(clone.response_ids, skip_special_tokens=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to decode clone response for reward fn: %s", exc)
+                clone_text = ""
+            clone_texts[request_id] = clone_text
+
+        try:
+            reward_value = self.clone_reward_fn(
+                root_answer,
+                root_output,
+                clone_rollouts or [],
+                root_text=decoded_masked,
+                clone_texts=clone_texts,
+            )
+        except TypeError:
+            try:
+                reward_value = self.clone_reward_fn(
+                    root_answer,
+                    root_output,
+                    clone_rollouts or [],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Reward function raised; defaulting to 0.0: %s", exc)
+                reward_value = 0.0
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reward function raised; defaulting to 0.0: %s", exc)
+            reward_value = 0.0
+
+        if self.clone_config.get("debug_reward_fields", False):
+            response_mask = root_output.response_mask or []
+            mask_tokens = int(sum(response_mask)) if response_mask else 0
+            total_tokens = int(len(response_mask))
+            root_output.extra_fields["reward_debug_root_decoded_raw"] = decoded_raw
+            root_output.extra_fields["reward_debug_root_decoded_masked"] = decoded_masked
+            root_output.extra_fields["reward_debug_root_answer"] = root_answer
+            root_output.extra_fields["reward_debug_response_mask_tokens"] = mask_tokens
+            root_output.extra_fields["reward_debug_response_tokens"] = total_tokens
+            root_output.extra_fields["reward_debug_response_mask_ratio"] = (
+                float(mask_tokens) / float(total_tokens) if total_tokens else 0.0
+            )
+
+        clone_rewards: dict[str, float] | None = None
+        if isinstance(reward_value, dict):
+            clone_rewards_raw = reward_value.get("clone_rewards")
+            if isinstance(clone_rewards_raw, dict):
+                clone_rewards = {}
+                for key, value in clone_rewards_raw.items():
+                    try:
+                        clone_rewards[str(key)] = float(value)
+                    except Exception:
+                        continue
+            elif isinstance(clone_rewards_raw, list):
+                clone_rewards = {}
+                if len(clone_rewards_raw) == len(clone_rollouts):
+                    for clone, value in zip(clone_rollouts, clone_rewards_raw):
+                        request_id = clone.extra_fields.get("request_id")
+                        if request_id is None:
+                            continue
+                        try:
+                            clone_rewards[str(request_id)] = float(value)
+                        except Exception:
+                            continue
+            if "reward" in reward_value:
+                reward_value = reward_value["reward"]
+            elif "score" in reward_value:
+                reward_value = reward_value["score"]
+        try:
+            reward_value = float(reward_value)
+        except Exception:
+            reward_value = 0.0
+
+        repair_penalty = self.clone_config.get("json_repair_penalty", 0.0)
+        if repair_penalty:
+            repair_count = int(root_output.extra_fields.get("tool_json_repair_count", 0) or 0)
+            if repair_count:
+                penalty_value = float(repair_penalty) * float(repair_count)
+                reward_value -= penalty_value
+                if self.clone_config.get("debug_reward_fields", False):
+                    root_output.extra_fields["reward_debug_json_repair_penalty"] = penalty_value
+
+        return reward_value, clone_rewards
+
+    def _normalize_context_key(self, value: str) -> str:
+        return " ".join(value.strip().split()).lower()
+
+    def _normalize_shared_context_keys(self, shared_context: Any) -> list[str]:
+        if shared_context is None:
+            return []
+        if isinstance(shared_context, str):
+            key = shared_context.strip()
+            return [key] if key else []
+        if isinstance(shared_context, list):
+            keys = []
+            for item in shared_context:
+                if item is None:
+                    continue
+                key = str(item).strip()
+                if key:
+                    keys.append(key)
+            return keys
+        if isinstance(shared_context, dict):
+            for field in ("keys", "ids", "titles"):
+                if field in shared_context:
+                    return self._normalize_shared_context_keys(shared_context[field])
+        key = str(shared_context).strip()
+        return [key] if key else []
+
+    def _context_items_to_map(self, items: list[Any]) -> dict[str, str]:
+        context_map: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or item.get("title") or "").strip()
+            if not key:
+                continue
+            text = item.get("text") or item.get("paragraph") or item.get("value")
+            if text is None:
+                continue
+            text = str(text).strip()
+            if not text:
+                continue
+            if key in context_map:
+                context_map[key] = f"{context_map[key]}\n{text}"
+            else:
+                context_map[key] = text
+        return context_map
+
+    def _get_context_map(self, agent_data: AgentData) -> dict[str, Any]:
+        extra_info = agent_data.extra_fields.get("extra_info") or {}
+        if isinstance(extra_info, dict):
+            context_map = extra_info.get("context_map")
+            if isinstance(context_map, dict):
+                return context_map
+            context_items = extra_info.get("context_items") or extra_info.get("context_entries")
+            if isinstance(context_items, list):
+                return self._context_items_to_map(context_items)
+        context_map = agent_data.extra_fields.get("context_map")
+        return context_map if isinstance(context_map, dict) else {}
+
+    def _format_context_value(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            parts = [str(part).strip() for part in value if part is not None and str(part).strip()]
+            return "\n".join(parts)
+        return str(value).strip()
+
+    def _render_shared_context(self, keys: list[str], agent_data: AgentData) -> str:
+        if not keys:
+            return ""
+        context_map = self._get_context_map(agent_data)
+        if not context_map:
+            missing = ", ".join(keys)
+            return f"Shared context requested but no context map is available. Missing keys: {missing}"
+
+        normalized_lookup = {self._normalize_context_key(k): k for k in context_map.keys()}
+        entries: list[tuple[str, str]] = []
+        missing: list[str] = []
+        for key in keys:
+            actual_key = key if key in context_map else normalized_lookup.get(self._normalize_context_key(key))
+            if not actual_key:
+                missing.append(key)
+                continue
+            text = self._format_context_value(context_map.get(actual_key))
+            if not text:
+                missing.append(actual_key)
+                continue
+            entries.append((actual_key, text))
+
+        lines = []
+        if entries:
+            lines.append("Shared context (expanded from keys):")
+            for title, text in entries:
+                lines.append(f"[{title}]\n{text}")
+        if missing:
+            lines.append(f"Missing context keys: {', '.join(missing)}")
+        return "\n\n".join(lines)
+
+    def _build_clone_prompt(self, request: dict[str, Any], agent_data: AgentData) -> list[dict[str, Any]]:
+        """Create a compact prompt for a clone instance."""
+        allow_tools = request.get("allow_tools", self.clone_config["allow_tool_use"])
+        user_sections = [request["instruction"]]
+        shared_context_keys = request.get("shared_context_keys") or []
+        if shared_context_keys:
+            shared_context_text = self._render_shared_context(shared_context_keys, agent_data)
+            if shared_context_text:
+                user_sections.append(shared_context_text)
+        if not allow_tools:
+            # user_sections.append("Do not call any tools; respond directly.")
+            pass
+        else:
+            user_sections.append("Use tools only if it shortens the path to the answer.")
+
+        return [
+            {"role": "system", "content": self.clone_config["system_prompt"]},
+            {"role": "user", "content": "\n\n".join([section for section in user_sections if section])},
+        ]
+
+    def _normalize_clone_requests(
+        self, tool_args: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Normalize user-specified clone objectives into a list of requests."""
+        if not isinstance(tool_args, dict):
+            return [], []
+
+        shared_context = tool_args.get("shared_context")
+        if shared_context is None:
+            shared_context = tool_args.get("context")
+        base_shared_context_keys = self._normalize_shared_context_keys(shared_context)
+        allow_tools = tool_args.get("allow_tools")
+        sampling_overrides = tool_args.get("sampling_overrides")
+        if sampling_overrides is not None and not isinstance(sampling_overrides, dict):
+            sampling_overrides = None
+
+        raw_requests = tool_args.get("objectives") or tool_args.get("tasks")
+        if raw_requests is None and "objective" in tool_args:
+            raw_requests = [tool_args["objective"]]
+        if raw_requests is None:
+            return [], []
+        if isinstance(raw_requests, str):
+            raw_requests = [raw_requests]
+        if not isinstance(raw_requests, list):
+            return (
+                [],
+                [
+                    {
+                        "index": 0,
+                        "name": None,
+                        "objective": None,
+                        "reason": "failed due to invalid objectives format",
+                    }
+                ],
+            )
+
+        names = tool_args.get("names") if isinstance(tool_args.get("names"), list) else None
+        normalized: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for idx, item in enumerate(raw_requests):
+            if isinstance(item, str):
+                name = names[idx] if names and idx < len(names) else None
+                instruction = item.strip()
+                if not instruction:
+                    rejected.append(
+                        {
+                            "index": idx,
+                            "name": name,
+                            "objective": None,
+                            "reason": "failed due to missing instruction",
+                        }
+                    )
+                    continue
+                normalized.append(
+                    {
+                        "instruction": instruction,
+                        "shared_context_keys": base_shared_context_keys,
+                        "name": name,
+                        "allow_tools": allow_tools,
+                        "sampling_overrides": sampling_overrides,
+                        "index": idx,
+                    }
+                )
+            elif isinstance(item, dict):
+                instruction = item.get("instruction") or item.get("objective") or item.get("task")
+                if isinstance(instruction, str):
+                    instruction = instruction.strip()
+                if not instruction:
+                    rejected.append(
+                        {
+                            "index": idx,
+                            "name": item.get("name") or item.get("label"),
+                            "objective": None,
+                            "reason": "failed due to missing instruction",
+                        }
+                    )
+                    continue
+                if not isinstance(instruction, str):
+                    rejected.append(
+                        {
+                            "index": idx,
+                            "name": item.get("name") or item.get("label"),
+                            "objective": None,
+                            "reason": "failed due to invalid instruction type",
+                        }
+                    )
+                    continue
+                item_context = item.get("shared_context")
+                if item_context is None:
+                    item_context = item.get("context")
+                shared_context_keys = (
+                    self._normalize_shared_context_keys(item_context)
+                    if item_context is not None
+                    else base_shared_context_keys
+                )
+                normalized.append(
+                    {
+                        "instruction": instruction,
+                        "shared_context_keys": shared_context_keys,
+                        "name": item.get("name") or item.get("label"),
+                        "allow_tools": item.get("allow_tools", allow_tools),
+                        "sampling_overrides": item.get("sampling_overrides", sampling_overrides),
+                        "index": idx,
+                    }
+                )
+            else:
+                rejected.append(
+                    {
+                        "index": idx,
+                        "name": None,
+                        "objective": None,
+                        "reason": "failed due to invalid objective type",
+                    }
+                )
+
+        for request in normalized:
+            if request.get("allow_tools") is None:
+                request["allow_tools"] = self.clone_config["allow_tool_use"]
+        return normalized, rejected
+
+    async def _run_single_clone(
+        self, request: dict[str, Any], agent_data: AgentData, sampling_params: dict[str, Any], index: int
+    ) -> CloneRunResult:
+        """Spin up a clone ToolAgentLoop using the same weights and context."""
+        clone_id = uuid4().hex
+        clone_depth = agent_data.extra_fields.get("clone_depth", 0) + 1
+        clone_label = self._resolve_clone_label(agent_data, request.get("name"), index)
+
+        clone_sampling = dict(sampling_params)
+        if request.get("sampling_overrides"):
+            clone_sampling.update(request["sampling_overrides"])
+
+        clone_prompt = self._build_clone_prompt(request, agent_data)
+        clone_loop = self.__class__(
+            trainer_config=_DummyConfig(config=self.config),
+            server_manager=self.server_manager,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+        )
+        clone_max_response = self.clone_config.get("max_response_length")
+        if clone_max_response is not None:
+            try:
+                clone_max_response = int(clone_max_response)
+            except (TypeError, ValueError):
+                clone_max_response = None
+        if clone_max_response and clone_max_response > 0:
+            clone_loop.response_length = min(clone_loop.response_length, clone_max_response)
+        clone_extra_info = copy.deepcopy(agent_data.extra_fields.get("extra_info") or {})
+        if not isinstance(clone_extra_info, dict):
+            clone_extra_info = {}
+        clone_extra_info.setdefault("interaction_kwargs", {})
+        clone_kwargs = {
+            "raw_prompt": clone_prompt,
+            "multi_modal_data": {},
+            "tools_kwargs": agent_data.tools_kwargs,
+            "extra_info": clone_extra_info,
+            "data_source": agent_data.extra_fields.get("data_source"),
+            "clone_depth": clone_depth,
+            "parent_request_id": agent_data.request_id,
+            "clone_label": clone_label,
+            "clone_allow_tools": request.get("allow_tools", self.clone_config["allow_tool_use"]),
+        }
+
+        clone_outputs = await clone_loop.run(clone_sampling, **clone_kwargs)
+        clone_outputs_list = clone_outputs if isinstance(clone_outputs, list) else [clone_outputs]
+        for output in clone_outputs_list:
+            output.extra_fields.setdefault("actor_role", "clone")
+            output.extra_fields.setdefault("clone_depth", clone_depth)
+            output.extra_fields.setdefault("parent_request_id", agent_data.request_id)
+            output.extra_fields.setdefault("clone_id", clone_id)
+            output.extra_fields.setdefault("clone_label", clone_label)
+            output.extra_fields.setdefault("clone_objective", request["instruction"])
+            output.extra_fields.setdefault("reward_extra_info", {})
+            output.extra_fields.setdefault("turn_scores", [])
+            output.extra_fields.setdefault("tool_rewards", [])
+            output.extra_fields.setdefault("reward_model", agent_data.extra_fields.get("reward_model"))
+            output.extra_fields.setdefault("data_source", agent_data.extra_fields.get("data_source"))
+            if agent_data.extra_fields.get("extra_info") is not None:
+                output.extra_fields["extra_info"] = agent_data.extra_fields.get("extra_info")
+            else:
+                output.extra_fields.pop("extra_info", None)
+            output.extra_fields["raw_prompt_override"] = clone_prompt
+
+        main_output = clone_outputs_list[0]
+        raw_text = self.tokenizer.decode(main_output.response_ids, skip_special_tokens=True)
+        visible_text = self._strip_thinking(raw_text)
+
+        return CloneRunResult(
+            clone_id=clone_id,
+            objective=request["instruction"],
+            label=clone_label,
+            visible_text=visible_text,
+            rollouts=clone_outputs_list,
+        )
+
+    async def _execute_clone_tool(
+        self, tool_args: dict[str, Any], agent_data: AgentData, sampling_params: dict[str, Any]
+    ) -> tuple[ToolResponse, float | None, dict[str, Any]]:
+        """Execute the built-in clone tool."""
+        current_depth = agent_data.extra_fields.get("clone_depth", 0)
+        if current_depth >= self.clone_config["max_clone_depth"]:
+            return (
+                ToolResponse(text="Clone tool disabled because maximum clone depth has been reached."),
+                None,
+                {},
+            )
+
+        requests, rejected = self._normalize_clone_requests(tool_args)
+        if not requests and not rejected:
+            return ToolResponse(text="No clone objectives provided."), None, {}
+
+        clone_tool_overrides = agent_data.tools_kwargs.get(self.clone_tool_name, {})
+        max_clones = clone_tool_overrides.get("max_clones_per_call", self.clone_config["max_clones_per_call"])
+        try:
+            max_clones = int(max_clones)
+        except Exception:
+            max_clones = self.clone_config["max_clones_per_call"]
+
+        if len(requests) > max_clones:
+            logger.info(
+                "Truncating clone requests from %d to max_clones_per_call=%d",
+                len(requests),
+                max_clones,
+            )
+            dropped = requests[max_clones:]
+            requests = requests[:max_clones]
+            for request in dropped:
+                rejected.append(
+                    {
+                        "index": request.get("index", 0),
+                        "name": request.get("name"),
+                        "objective": request.get("instruction"),
+                        "reason": "failed due to clone limit",
+                    }
+                )
+
+        await self._allocate_clone_indices(agent_data, requests, rejected)
+
+        tasks = [
+            self._run_single_clone(request, agent_data, sampling_params, index=request.get("index", 0))
+            for request in requests
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        clone_rollouts: list[AgentLoopOutput] = []
+        clone_summaries: list[dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
+        summary_max_length = self.clone_config.get("summary_max_length")
+        if summary_max_length is None:
+            summary_max_length = self.max_tool_response_length
+        summary_truncate_side = (
+            self.clone_config.get("summary_truncate_side") or self.tool_response_truncate_side or "left"
+        )
+        for request, result in zip(requests, results):
+            label = self._resolve_clone_label(agent_data, request.get("name"), request.get("index", 0))
+            objective = request.get("instruction")
+            if isinstance(result, Exception):
+                summary_text = self._truncate_tool_response_text(
+                    self._summarize_clone_error(result),
+                    max_length=summary_max_length,
+                    truncate_side=summary_truncate_side,
+                )
+                entries.append(
+                    {
+                        "index": request.get("index", 0),
+                        "label": label,
+                        "text": summary_text,
+                        "objective": objective,
+                        "status": "failed",
+                    }
+                )
+                continue
+            summary_text = self._truncate_tool_response_text(
+                result.visible_text,
+                max_length=summary_max_length,
+                truncate_side=summary_truncate_side,
+            )
+            clone_rollouts.extend(result.rollouts)
+            clone_summaries.append(
+                {
+                    "clone_id": result.clone_id,
+                    "label": result.label,
+                    "objective": result.objective,
+                    "answer": summary_text,
+                }
+            )
+            entries.append(
+                {
+                    "index": request.get("index", 0),
+                    "label": result.label,
+                    "text": summary_text,
+                    "objective": result.objective,
+                    "status": "ok",
+                }
+            )
+
+        for request in rejected:
+            summary_text = self._truncate_tool_response_text(
+                request.get("reason", "failed due to invalid objective"),
+                max_length=summary_max_length,
+                truncate_side=summary_truncate_side,
+            )
+            entries.append(
+                {
+                    "index": request.get("index", 0),
+                    "label": self._resolve_clone_label(agent_data, request.get("name"), request.get("index", 0)),
+                    "text": summary_text,
+                    "objective": request.get("objective"),
+                    "status": "failed",
+                }
+            )
+
+        lines = []
+        if entries:
+            for entry in sorted(entries, key=lambda item: item.get("index", 0)):
+                text = entry["text"]
+                if entry.get("status") == "failed" and entry.get("objective"):
+                    text = f"{text} (objective: {entry['objective']})"
+                lines.append(f"{entry['label']}: {text}")
+
+        tool_response_text = "\n".join(lines) if lines else "No clone returned a response."
+        tool_response_text = self._truncate_tool_response_text(tool_response_text)
+
+        extra = {
+            "clone_rollouts": clone_rollouts,
+            "clone_summaries": clone_summaries,
+            "clone_depth": current_depth,
+        }
+        return ToolResponse(text=tool_response_text), None, extra
 
     @classmethod
     def _initialize_interactions(cls, interaction_config_file):

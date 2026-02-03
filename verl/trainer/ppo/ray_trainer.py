@@ -25,7 +25,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -44,9 +44,12 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_agentic_clone_eval_stats,
+    compute_agentic_reward_mask_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    format_agentic_clone_eval_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -182,6 +185,151 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _compute_grpo_advantage_with_clones(
+    data: DataProto,
+    adv_estimator: AdvantageEstimator,
+    norm_adv_by_std_in_grpo: bool,
+    config: Optional[AlgoConfig],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Compute GRPO advantages on root rollouts, then broadcast to clone generations."""
+    roles = data.non_tensor_batch.get("actor_role")
+    if roles is None:
+        return None
+
+    roles = np.asarray(roles, dtype=object)
+    if roles.size == 0 or not np.any(roles == "clone"):
+        return None
+
+    request_ids = data.non_tensor_batch.get("request_id")
+    parent_request_ids = data.non_tensor_batch.get("parent_request_id")
+    if request_ids is None or parent_request_ids is None:
+        raise ValueError(
+            "Clone rollouts detected but request_id/parent_request_id missing; "
+            "cannot broadcast GRPO advantages."
+        )
+
+    if "uid" not in data.non_tensor_batch:
+        raise ValueError("GRPO requires uid in non_tensor_batch when clones are present.")
+
+    request_ids = np.asarray(request_ids, dtype=object)
+    parent_request_ids = np.asarray(parent_request_ids, dtype=object)
+    root_mask = roles == "root"
+    if not root_mask.any():
+        raise ValueError("Clone rollouts detected but no root rollouts found.")
+
+    token_level_rewards = data.batch["token_level_rewards"]
+    response_mask = data.batch["response_mask"]
+
+    root_mask_t = torch.as_tensor(root_mask, device=response_mask.device)
+    root_rewards = token_level_rewards[root_mask_t]
+    root_response_mask = response_mask[root_mask_t]
+    root_index = np.asarray(data.non_tensor_batch["uid"], dtype=object)[root_mask]
+
+    if adv_estimator == AdvantageEstimator.GRPO:
+        root_adv, _ = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=root_rewards,
+            response_mask=root_response_mask,
+            index=root_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+    elif adv_estimator == AdvantageEstimator.GRPO_VECTORIZED:
+        root_adv, _ = core_algos.compute_grpo_vectorized_outcome_advantage(
+            token_level_rewards=root_rewards,
+            response_mask=root_response_mask,
+            index=root_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+    elif adv_estimator == AdvantageEstimator.GRPO_PASSK:
+        root_adv, _ = core_algos.compute_grpo_passk_outcome_advantage(
+            token_level_rewards=root_rewards,
+            response_mask=root_response_mask,
+            index=root_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+    else:
+        return None
+
+    root_lengths = root_response_mask.sum(dim=-1).clamp(min=1)
+    root_scalars = (root_adv.sum(dim=-1) / root_lengths).detach()
+    root_token_rewards = token_level_rewards[root_mask_t]
+    root_reward_sums = (root_token_rewards * root_response_mask).sum(dim=-1)
+
+    root_request_ids = request_ids[root_mask]
+    root_scalar_map = {rid: root_scalars[i].item() for i, rid in enumerate(root_request_ids)}
+    root_reward_map = {rid: root_reward_sums[i].item() for i, rid in enumerate(root_request_ids)}
+    parent_map = {rid: parent_request_ids[i] for i, rid in enumerate(request_ids) if rid is not None}
+    resolved_cache: dict[Any, float] = {}
+    resolved_reward_cache: dict[Any, float] = {}
+
+    def _resolve_scalar(req_id) -> float:
+        current = req_id
+        seen = set()
+        while current is not None and current not in seen:
+            if current in resolved_cache:
+                return resolved_cache[current]
+            if current in root_scalar_map:
+                resolved_cache[current] = root_scalar_map[current]
+                return root_scalar_map[current]
+            seen.add(current)
+            current = parent_map.get(current)
+        return 0.0
+
+    def _resolve_root_reward(req_id) -> float:
+        current = req_id
+        seen = set()
+        while current is not None and current not in seen:
+            if current in resolved_reward_cache:
+                return resolved_reward_cache[current]
+            if current in root_reward_map:
+                resolved_reward_cache[current] = root_reward_map[current]
+                return root_reward_map[current]
+            seen.add(current)
+            current = parent_map.get(current)
+        return 0.0
+
+    bsz = response_mask.size(0)
+    scalars = torch.zeros(bsz, device=response_mask.device, dtype=root_adv.dtype)
+    scalars[root_mask_t] = root_scalars
+
+    clone_mask = roles == "clone"
+    if clone_mask.any():
+        clone_mask_t = torch.as_tensor(clone_mask, device=response_mask.device)
+        clone_parent_ids = parent_request_ids[clone_mask]
+
+        # NEW: Scale clone advantages by their reward relative to parent root
+        # Use sequence-level reward sums to stay aligned with GRPO's grouping.
+        clone_token_rewards = token_level_rewards[clone_mask_t]
+        clone_response_masks = response_mask[clone_mask_t]
+        clone_reward_sums = (clone_token_rewards * clone_response_masks).sum(dim=-1)
+
+        parent_root_reward_sums = [_resolve_root_reward(pid) for pid in clone_parent_ids]
+        parent_root_reward_sums_t = torch.tensor(
+            parent_root_reward_sums, device=response_mask.device, dtype=root_adv.dtype
+        )
+
+        # Compute signed scaling factor: clone_reward / root_reward
+        eps = 1e-8
+        denom_sign = torch.sign(parent_root_reward_sums_t)
+        denom_sign = torch.where(denom_sign == 0, torch.ones_like(denom_sign), denom_sign)
+        denom_safe = denom_sign * parent_root_reward_sums_t.abs().clamp(min=eps)
+        reward_ratios = clone_reward_sums / denom_safe
+
+        # Clamp ratio to prevent extreme scaling
+        reward_ratios = reward_ratios.clamp(-1.5, 1.5)
+
+        # Scale root advantages by reward ratio
+        clone_base_scalars = [_resolve_scalar(pid) for pid in clone_parent_ids]
+        clone_base_scalars_t = torch.tensor(clone_base_scalars, device=response_mask.device, dtype=root_adv.dtype)
+        scaled_clone_scalars = clone_base_scalars_t * reward_ratios
+
+        scalars[clone_mask_t] = scaled_clone_scalars
+
+    advantages = scalars.unsqueeze(-1) * response_mask
+    returns = advantages
+    return advantages, returns
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -212,6 +360,24 @@ def compute_advantage(
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+
+    if adv_estimator in {
+        AdvantageEstimator.GRPO,
+        AdvantageEstimator.GRPO_VECTORIZED,
+        AdvantageEstimator.GRPO_PASSK,
+    }:
+        clone_adv = _compute_grpo_advantage_with_clones(
+            data,
+            adv_estimator=adv_estimator,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        if clone_adv is not None:
+            advantages, returns = clone_adv
+            data.batch["advantages"] = advantages
+            data.batch["returns"] = returns
+            return data
+
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -270,6 +436,8 @@ class RayPPOTrainer:
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
     """
+
+    FANOUT_INDEX_KEY = "__fanout_index__"
 
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
@@ -522,6 +690,8 @@ class RayPPOTrainer:
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        if "index" not in batch.non_tensor_batch:
+            batch.non_tensor_batch["index"] = np.arange(len(batch))
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -537,9 +707,54 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _filter_rollouts_to_roots(self, rollouts: DataProto) -> DataProto:
+        """Drop clone rollouts during validation metrics aggregation."""
+        role_key = "actor_role"
+        if role_key not in rollouts.non_tensor_batch:
+            return rollouts
+
+        roles = np.asarray(rollouts.non_tensor_batch[role_key], dtype=object)
+        mask = roles != "clone"
+        if not mask.any():
+            return rollouts
+        return rollouts.select_idxs(mask)
+
+    def _align_batch_with_rollouts(
+        self, batch: DataProto, rollouts: DataProto, *, return_indices: bool = False
+    ) -> DataProto | tuple[DataProto, np.ndarray]:
+        """
+        Expand the original batch to match a fan-out rollout batch (e.g., when agent loops spawn clones).
+        Falls back to the legacy fixed repeat when no fan-out index is available.
+        """
+        index_key = self.FANOUT_INDEX_KEY
+        if index_key not in rollouts.non_tensor_batch:
+            indices = np.repeat(np.arange(len(batch)), self.config.actor_rollout_ref.rollout.n)
+            aligned = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+            return (aligned, indices) if return_indices else aligned
+
+        indices = np.asarray(rollouts.non_tensor_batch[index_key])
+        if indices.dtype == bool:
+            indices = np.nonzero(indices)[0]
+        indices = indices.reshape(-1).astype(np.int64, copy=False)
+
+        if indices.size == 0:
+            return batch.select_idxs(indices)
+
+        max_idx = indices.max(initial=-1)
+        min_idx = indices.min(initial=0)
+        if max_idx >= len(batch) or min_idx < 0:
+            raise ValueError(
+                f"Fan-out indices out of bounds: min={min_idx}, max={max_idx}, base batch={len(batch)}"
+            )
+
+        aligned = batch.select_idxs(indices)
+        return (aligned, indices) if return_indices else aligned
+
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        clone_eval_enabled = OmegaConf.select(self.config, "trainer.debug_agentic_clone_eval_metrics", default=False)
+        clone_eval_stats_total: dict[str, int] | None = None
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -556,11 +771,15 @@ class RayPPOTrainer:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
+            if "index" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["index"] = np.arange(len(test_batch))
 
             # repeat test batch
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
+            if "fanout_index" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["fanout_index"] = np.arange(len(test_batch))
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
@@ -570,13 +789,10 @@ class RayPPOTrainer:
             input_ids = test_batch.batch["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
-
-            ground_truths = [
+            uids_full = test_batch.non_tensor_batch["uid"]
+            ground_truths_full = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
-            sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -607,12 +823,32 @@ class RayPPOTrainer:
             print("validation generation end")
 
             # Store generated outputs
+            test_output_gen_batch = self._filter_rollouts_to_roots(test_output_gen_batch)
+            test_batch, alignment_indices = self._align_batch_with_rollouts(
+                test_batch, test_output_gen_batch, return_indices=True
+            )
+
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            # Align logged inputs/uids/ground_truths with the retained rollouts
+            alignment_indices_np = np.asarray(alignment_indices, dtype=int)
+            sample_inputs.extend([input_texts[i] for i in alignment_indices_np])
+            sample_uids.extend(uids_full[alignment_indices_np].tolist())
+            sample_gts.extend([ground_truths_full[i] for i in alignment_indices_np])
+
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            if clone_eval_enabled:
+                stats = compute_agentic_clone_eval_stats(test_batch, self.tokenizer)
+                if stats:
+                    if clone_eval_stats_total is None:
+                        clone_eval_stats_total = stats
+                    else:
+                        for key, value in stats.items():
+                            clone_eval_stats_total[key] = clone_eval_stats_total.get(key, 0) + int(value)
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -675,6 +911,9 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        if clone_eval_stats_total:
+            metric_dict.update(format_agentic_clone_eval_metrics(clone_eval_stats_total, prefix="val-aux/agentic"))
 
         return metric_dict
 
@@ -1016,6 +1255,36 @@ class RayPPOTrainer:
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
         workload_lst = calculate_workload(global_seqlen_lst)
         world_size = self.actor_rollout_wg.world_size
+        if batch_size < world_size:
+            metrics[f"{logging_prefix}/skipped_small_batch"] = 1
+            return
+        # Keep the batch divisible by world_size; prefer dropping clones if present.
+        remainder = batch_size % world_size
+        if remainder != 0:
+            drop_count = remainder
+            drop_indices = []
+            roles = batch.non_tensor_batch.get("actor_role")
+            if roles is not None:
+                roles = np.asarray(roles, dtype=object)
+                clone_indices = np.where(roles == "clone")[0].tolist()
+                if clone_indices:
+                    clone_indices.sort(key=lambda idx: workload_lst[idx])
+                    drop_indices.extend(clone_indices[:drop_count])
+            if len(drop_indices) < drop_count:
+                remaining = drop_count - len(drop_indices)
+                remaining_candidates = [idx for idx in range(batch_size) if idx not in set(drop_indices)]
+                remaining_candidates.sort(key=lambda idx: workload_lst[idx])
+                drop_indices.extend(remaining_candidates[:remaining])
+            keep_indices = [idx for idx in range(batch_size) if idx not in set(drop_indices)]
+            batch.reorder(torch.tensor(keep_indices))
+            metrics[f"{logging_prefix}/dropped"] = drop_count
+            if roles is not None:
+                dropped_clones = sum(1 for idx in drop_indices if roles[idx] == "clone")
+                metrics[f"{logging_prefix}/dropped_clones"] = dropped_clones
+            attention_mask = batch.batch["attention_mask"]
+            batch_size = attention_mask.shape[0]
+            global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)
+            workload_lst = calculate_workload(global_seqlen_lst)
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
@@ -1250,6 +1519,8 @@ class RayPPOTrainer:
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
+                if "fanout_index" not in batch.non_tensor_batch:
+                    batch.non_tensor_batch["fanout_index"] = np.arange(len(batch))
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -1282,6 +1553,7 @@ class RayPPOTrainer:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            batch = self._align_batch_with_rollouts(batch, gen_baseline_output)
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
@@ -1303,8 +1575,8 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # Align base batch with rollout fan-out (e.g., clone-generated rollouts)
+                    batch = self._align_batch_with_rollouts(batch, gen_batch_output)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1516,6 +1788,11 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if OmegaConf.select(self.config, "trainer.debug_agentic_reward_mask_metrics", default=False):
+                    metrics.update(compute_agentic_reward_mask_metrics(batch))
+                if OmegaConf.select(self.config, "trainer.debug_agentic_clone_eval_metrics", default=False):
+                    clone_eval_stats = compute_agentic_clone_eval_stats(batch, self.tokenizer)
+                    metrics.update(format_agentic_clone_eval_metrics(clone_eval_stats, prefix="agentic"))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

@@ -17,6 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
+import re
 from typing import Any, Callable
 
 import numpy as np
@@ -24,6 +25,7 @@ import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+from verl.utils.reward_score.math_reward import is_equiv
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -75,6 +77,485 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         prompt_length=prompt_length,
         response_length=response_length,
     )
+
+
+def _compute_agentic_clone_metrics(batch: DataProto) -> dict[str, Any]:
+    roles = batch.non_tensor_batch.get("actor_role")
+    request_ids = batch.non_tensor_batch.get("request_id")
+    parent_request_ids = batch.non_tensor_batch.get("parent_request_id")
+    if roles is None or request_ids is None or parent_request_ids is None:
+        return {}
+
+    roles = np.asarray(roles, dtype=object)
+    request_ids = np.asarray(request_ids, dtype=object)
+    parent_request_ids = np.asarray(parent_request_ids, dtype=object)
+    if roles.size == 0:
+        return {}
+
+    if "response_mask" not in batch.batch.keys():
+        return {}
+    response_mask = batch.batch["response_mask"]
+
+    generated_tokens = response_mask.sum(dim=-1).detach().cpu().numpy().astype(np.float32)
+    response_info = _compute_response_info(batch)
+    prompt_length = response_info["prompt_length"].detach().cpu().numpy().astype(np.float32)
+    response_length = response_info["response_length"].detach().cpu().numpy().astype(np.float32)
+
+    root_mask = roles == "root"
+    if not root_mask.any():
+        return {}
+
+    root_indices = np.nonzero(root_mask)[0]
+    root_generated_tokens = []
+    root_prompt_tokens = []
+    root_response_tokens = []
+    clone_counts = []
+    clone_generated_tokens = []
+    total_generated_tokens = []
+    for idx in root_indices:
+        root_id = request_ids[idx]
+        if root_id is None:
+            continue
+
+        clone_mask = parent_request_ids == root_id
+        clone_count = int(clone_mask.sum())
+        clone_generated = float(generated_tokens[clone_mask].sum()) if clone_count else 0.0
+        root_generated = float(generated_tokens[idx])
+        root_prompt = float(prompt_length[idx])
+        root_response = float(response_length[idx])
+        total_generated = root_generated + clone_generated
+
+        root_generated_tokens.append(root_generated)
+        root_prompt_tokens.append(root_prompt)
+        root_response_tokens.append(root_response)
+        clone_counts.append(clone_count)
+        clone_generated_tokens.append(clone_generated)
+        total_generated_tokens.append(total_generated)
+
+    if not root_generated_tokens:
+        return {}
+
+    metrics: dict[str, Any] = {}
+
+    def _add_stats(name: str, values: list[float]) -> None:
+        arr = np.asarray(values, dtype=np.float32)
+        metrics[f"agentic/{name}/mean"] = float(arr.mean())
+        metrics[f"agentic/{name}/max"] = float(arr.max())
+        metrics[f"agentic/{name}/min"] = float(arr.min())
+
+    _add_stats("root_generated_tokens", root_generated_tokens)
+    _add_stats("root_prompt_tokens", root_prompt_tokens)
+    _add_stats("root_response_tokens", root_response_tokens)
+    _add_stats("clone_count", clone_counts)
+    _add_stats("clone_generated_tokens", clone_generated_tokens)
+    _add_stats("total_generated_tokens", total_generated_tokens)
+
+    total_clone_tokens = float(np.sum(clone_generated_tokens))
+    total_clone_count = float(np.sum(clone_counts))
+    metrics["agentic/clone_tokens_per_clone"] = (
+        total_clone_tokens / total_clone_count if total_clone_count > 0 else 0.0
+    )
+
+    return metrics
+
+
+def _compute_tool_json_metrics(batch: DataProto) -> dict[str, Any]:
+    total_calls = batch.non_tensor_batch.get("tool_json_total_calls")
+    repair_counts = batch.non_tensor_batch.get("tool_json_repair_count")
+    parse_failures = batch.non_tensor_batch.get("tool_json_parse_failures")
+    if total_calls is None and repair_counts is None and parse_failures is None:
+        return {}
+
+    batch_size = len(batch)
+
+    def _coerce(values):
+        if values is None:
+            return np.zeros(batch_size, dtype=np.float32)
+        arr = np.asarray(values, dtype=object)
+        return np.array([float(v) if v is not None else 0.0 for v in arr], dtype=np.float32)
+
+    total_calls_arr = _coerce(total_calls)
+    repair_counts_arr = _coerce(repair_counts)
+    parse_failures_arr = _coerce(parse_failures)
+
+    metrics: dict[str, Any] = {}
+
+    def _add_stats(prefix: str, values: np.ndarray) -> None:
+        metrics[f"{prefix}/mean"] = float(values.mean())
+        metrics[f"{prefix}/max"] = float(values.max())
+        metrics[f"{prefix}/min"] = float(values.min())
+        metrics[f"{prefix}/total"] = float(values.sum())
+
+    _add_stats("tool_json/repairs", repair_counts_arr)
+    _add_stats("tool_json/parse_failures", parse_failures_arr)
+    _add_stats("tool_json/total_calls", total_calls_arr)
+
+    with_calls = total_calls_arr > 0
+    if with_calls.any():
+        metrics["tool_json/repair_rate"] = float((repair_counts_arr[with_calls] / total_calls_arr[with_calls]).mean())
+        metrics["tool_json/parse_failure_rate"] = float(
+            (parse_failures_arr[with_calls] / total_calls_arr[with_calls]).mean()
+        )
+
+    return metrics
+
+
+def compute_agentic_reward_mask_metrics(batch: DataProto) -> dict[str, Any]:
+    roles = batch.non_tensor_batch.get("actor_role")
+    if roles is None:
+        return {}
+
+    if "response_mask" not in batch.batch or "attention_mask" not in batch.batch:
+        return {}
+
+    roles = np.asarray(roles, dtype=object)
+    if roles.size == 0:
+        return {}
+
+    response_mask = batch.batch["response_mask"].bool()
+    response_length = batch.batch["attention_mask"][:, -response_mask.size(-1) :].sum(dim=-1).long()
+
+    valid = response_length > 0
+    if not torch.any(valid):
+        return {}
+
+    reward_index = response_length - 1
+    reward_masked = torch.zeros_like(valid, dtype=torch.bool)
+
+    valid_rows = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+    reward_cols = reward_index[valid]
+    reward_masked[valid_rows] = ~response_mask[valid_rows, reward_cols]
+
+    reward_masked_np = reward_masked.detach().cpu().numpy()
+    valid_np = valid.detach().cpu().numpy()
+
+    metrics: dict[str, Any] = {}
+
+    def _add_rate(name: str, mask: np.ndarray) -> None:
+        mask = mask & valid_np
+        if not mask.any():
+            return
+        metrics[f"agentic/reward_masked_rate/{name}"] = float(reward_masked_np[mask].mean())
+
+    _add_rate("all", np.ones_like(valid_np, dtype=bool))
+    _add_rate("root", roles == "root")
+    _add_rate("clone", roles == "clone")
+
+    return metrics
+
+
+_INT_PATTERN = re.compile(r"-?\d[\d,]*")
+_EXPR_FRAGMENT = re.compile(r"[0-9+\-*/ ()]+")
+_ANSWER_MARKERS = (
+    "</think>",
+    "Final Answer:",
+    "final answer:",
+    "Answer:",
+    "answer:",
+    "Result:",
+    "OUTPUT:",
+    "#### ",
+)
+
+
+def _extract_last_int(text: str) -> int | None:
+    if not text:
+        return None
+    matches = _INT_PATTERN.findall(text)
+    if not matches:
+        return None
+    candidate = matches[-1].replace(",", "")
+    try:
+        return int(candidate)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_expression(text: Any) -> str | None:
+    if not text:
+        return None
+    expr_text = str(text).replace(",", "")
+    candidates = []
+    for match in _EXPR_FRAGMENT.finditer(expr_text):
+        candidate = match.group(0).strip()
+        if not candidate:
+            continue
+        if not any(ch.isdigit() for ch in candidate):
+            continue
+        candidates.append(candidate)
+    if not candidates:
+        return None
+    with_ops = [c for c in candidates if any(ch in "+-*/" for ch in c)]
+    if with_ops:
+        candidates = with_ops
+    best = max(candidates, key=len)
+    best = best.strip()
+    while best and best[-1] in "+-*/":
+        best = best[:-1].strip()
+    while best and best[0] in "+*/":
+        best = best[1:].strip()
+    if not best or not any(ch.isdigit() for ch in best):
+        return None
+    return best
+
+
+def _safe_eval_int(expr: str) -> int | None:
+    try:
+        value = eval(expr, {"__builtins__": {}}, {})
+    except Exception:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _strip_answer_markers(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text
+    if "</think>" in stripped:
+        stripped = stripped.split("</think>")[-1]
+    for marker in _ANSWER_MARKERS:
+        if marker in stripped:
+            stripped = stripped.split(marker, 1)[-1]
+    stripped = stripped.strip()
+    if stripped:
+        return stripped
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _coerce_ground_truth(ground_truth: Any) -> Any:
+    if isinstance(ground_truth, list) and len(ground_truth) == 1:
+        return ground_truth[0]
+    return ground_truth
+
+
+def _resolve_data_source(
+    data_sources: np.ndarray | None, reward_models: np.ndarray | None, idx: int
+) -> str:
+    if data_sources is not None:
+        source = data_sources[idx]
+        if source is not None:
+            source_str = str(source)
+            if source_str:
+                return source_str
+    if reward_models is not None:
+        reward_model = reward_models[idx]
+        if isinstance(reward_model, dict):
+            source = reward_model.get("data_source")
+            if source is not None:
+                source_str = str(source)
+                if source_str:
+                    return source_str
+    return "unknown"
+
+
+def compute_agentic_clone_eval_stats(batch: DataProto, tokenizer) -> dict[str, int]:
+    if tokenizer is None:
+        return {}
+
+    if "responses" not in batch.batch or "response_mask" not in batch.batch:
+        return {}
+    responses = batch.batch["responses"]
+    response_mask = batch.batch["response_mask"]
+
+    roles = batch.non_tensor_batch.get("actor_role")
+    if roles is None:
+        roles = np.array(["root"] * len(batch), dtype=object)
+    else:
+        roles = np.asarray(roles, dtype=object)
+
+    reward_models = batch.non_tensor_batch.get("reward_model")
+    if reward_models is not None:
+        reward_models = np.asarray(reward_models, dtype=object)
+
+    data_sources = batch.non_tensor_batch.get("data_source")
+    if data_sources is not None:
+        data_sources = np.asarray(data_sources, dtype=object)
+
+    clone_objectives = batch.non_tensor_batch.get("clone_objective")
+    if clone_objectives is not None:
+        clone_objectives = np.asarray(clone_objectives, dtype=object)
+
+    request_ids = batch.non_tensor_batch.get("request_id")
+    parent_request_ids = batch.non_tensor_batch.get("parent_request_id")
+    if request_ids is not None:
+        request_ids = np.asarray(request_ids, dtype=object)
+    if parent_request_ids is not None:
+        parent_request_ids = np.asarray(parent_request_ids, dtype=object)
+
+    response_info = _compute_response_info(batch) if "attention_mask" in batch.batch else None
+    if response_info is not None:
+        prompt_length = response_info["prompt_length"].detach().cpu().numpy().astype(np.float32)
+        response_length = response_info["response_length"].detach().cpu().numpy().astype(np.float32)
+    else:
+        response_length = response_mask.sum(dim=-1).detach().cpu().numpy().astype(np.float32)
+        prompt_length = np.zeros_like(response_length)
+
+    stats = {
+        "root_total": 0,
+        "root_correct": 0,
+        "clone_total": 0,
+        "clone_expr": 0,
+        "clone_expr_answer_int": 0,
+        "clone_expr_correct": 0,
+        "root_total_tokens_sum": 0,
+        "total_tokens_with_clones_sum": 0,
+    }
+    stats_by_source: dict[str, dict[str, int]] = {}
+
+    def _ensure_source(source: str) -> dict[str, int]:
+        if source not in stats_by_source:
+            stats_by_source[source] = {key: 0 for key in stats}
+        return stats_by_source[source]
+
+    for idx in range(len(batch)):
+        role = roles[idx]
+        mask = response_mask[idx]
+        if hasattr(mask, "detach"):
+            mask = mask.detach().cpu()
+        mask = mask.bool()
+        if not mask.any():
+            continue
+
+        tokens = responses[idx]
+        if hasattr(tokens, "detach"):
+            tokens = tokens.detach().cpu()
+        text = tokenizer.decode(tokens[mask].tolist(), skip_special_tokens=True)
+        answer_int = _extract_last_int(text)
+        source = _resolve_data_source(data_sources, reward_models, idx)
+        source_stats = _ensure_source(source)
+
+        if role == "root":
+            if reward_models is None:
+                continue
+            reward_model = reward_models[idx]
+            if not isinstance(reward_model, dict):
+                continue
+            if "arithmetic" in source:
+                gt = reward_model.get("ground_truth")
+                gt_int = _extract_last_int(str(gt)) if gt is not None else None
+                if gt_int is None:
+                    continue
+                stats["root_total"] += 1
+                if request_ids is not None and parent_request_ids is not None:
+                    root_id = request_ids[idx]
+                    if root_id is not None:
+                        clone_mask = parent_request_ids == root_id
+                        root_total_tokens = float(prompt_length[idx] + response_length[idx])
+                        clone_total_tokens = float(
+                            (prompt_length[clone_mask] + response_length[clone_mask]).sum()
+                        ) if clone_mask.any() else 0.0
+                        stats["root_total_tokens_sum"] += int(root_total_tokens)
+                        stats["total_tokens_with_clones_sum"] += int(root_total_tokens + clone_total_tokens)
+                if answer_int is not None and answer_int == gt_int:
+                    stats["root_correct"] += 1
+                continue
+            else:
+                gt = _coerce_ground_truth(reward_model.get("ground_truth"))
+                if gt is None:
+                    continue
+                stats["root_total"] += 1
+                if request_ids is not None and parent_request_ids is not None:
+                    root_id = request_ids[idx]
+                    if root_id is not None:
+                        clone_mask = parent_request_ids == root_id
+                        root_total_tokens = float(prompt_length[idx] + response_length[idx])
+                        clone_total_tokens = float(
+                            (prompt_length[clone_mask] + response_length[clone_mask]).sum()
+                        ) if clone_mask.any() else 0.0
+                        stats["root_total_tokens_sum"] += int(root_total_tokens)
+                        stats["total_tokens_with_clones_sum"] += int(root_total_tokens + clone_total_tokens)
+                source_stats["root_total"] += 1
+                answer_text = _strip_answer_markers(text)
+                if is_equiv(answer_text, str(gt)):
+                    stats["root_correct"] += 1
+                    source_stats["root_correct"] += 1
+                continue
+
+        if role != "clone":
+            continue
+
+        stats["clone_total"] += 1
+        source_stats["clone_total"] += 1
+        if clone_objectives is None:
+            continue
+        expr = _normalize_expression(clone_objectives[idx])
+        if expr is None:
+            continue
+        stats["clone_expr"] += 1
+        source_stats["clone_expr"] += 1
+        if answer_int is None:
+            continue
+        stats["clone_expr_answer_int"] += 1
+        source_stats["clone_expr_answer_int"] += 1
+        target = _safe_eval_int(expr)
+        if target is not None and answer_int == target:
+            stats["clone_expr_correct"] += 1
+            source_stats["clone_expr_correct"] += 1
+
+    flat_stats = dict(stats)
+    for source, source_stats in stats_by_source.items():
+        for key, value in source_stats.items():
+            flat_stats[f"data_source={source}/{key}"] = value
+
+    return flat_stats
+
+
+def _format_agentic_clone_eval_metrics_group(stats: dict[str, int], prefix: str) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+
+    root_total = stats.get("root_total", 0)
+    if root_total:
+        metrics[f"{prefix}/root_acc"] = stats.get("root_correct", 0) / root_total
+
+    clone_total = stats.get("clone_total", 0)
+    if clone_total:
+        metrics[f"{prefix}/clone_objective_expr_rate"] = stats.get("clone_expr", 0) / clone_total
+
+    clone_expr = stats.get("clone_expr", 0)
+    if clone_expr:
+        metrics[f"{prefix}/clone_answer_int_rate"] = stats.get("clone_expr_answer_int", 0) / clone_expr
+
+    clone_expr_answer_int = stats.get("clone_expr_answer_int", 0)
+    if clone_expr_answer_int:
+        metrics[f"{prefix}/clone_correct_rate"] = stats.get("clone_expr_correct", 0) / clone_expr_answer_int
+
+    root_total = stats.get("root_total", 0)
+    if root_total:
+        total_tokens_sum = stats.get("total_tokens_with_clones_sum", 0)
+        if total_tokens_sum:
+            metrics[f"{prefix}/root_total_tokens_with_clones_mean"] = total_tokens_sum / root_total
+
+    return metrics
+
+
+def format_agentic_clone_eval_metrics(stats: dict[str, int], prefix: str = "agentic") -> dict[str, Any]:
+    if not stats:
+        return {}
+
+    metrics: dict[str, Any] = {}
+    metrics.update(_format_agentic_clone_eval_metrics_group(stats, prefix))
+
+    data_source_stats: dict[str, dict[str, int]] = defaultdict(dict)
+    for key, value in stats.items():
+        if not key.startswith("data_source="):
+            continue
+        remainder = key[len("data_source=") :]
+        if "/" not in remainder:
+            continue
+        source, stat_key = remainder.rsplit("/", 1)
+        data_source_stats[source][stat_key] = value
+
+    for source, source_stats in data_source_stats.items():
+        metrics.update(_format_agentic_clone_eval_metrics_group(source_stats, f"{prefix}/{source}"))
+
+    return metrics
 
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
@@ -220,6 +701,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    metrics.update(_compute_agentic_clone_metrics(batch))
+    metrics.update(_compute_tool_json_metrics(batch))
 
     return metrics
 
